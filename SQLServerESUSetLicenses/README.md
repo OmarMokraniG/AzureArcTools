@@ -16,6 +16,22 @@ later** to control when billing starts.
 > program starts on that date. Create the licenses now in the `Inactive` state and activate them
 > on/after that date to avoid early charges.
 
+### Two ESU models
+
+SQL Server enabled by Azure Arc offers two ESU models, and this script supports both:
+
+| | **p-core license** (default) | **v-core per machine** |
+| --- | --- | --- |
+| Where | A scope resource `Microsoft.AzureArcData/sqlServerEsuLicenses` (per RG/subscription/tenant) | The **SQL Server configuration** of each Arc machine (the Azure Extension for SQL Server) |
+| Billing | By **physical cores** with unlimited virtualization | By **v-cores** of the VM (or physical cores on bare metal); auto-detected |
+| Control | `activationState` `Inactive` → `Active` → `Terminated` | `enableExtendedSecurityUpdates` `true`/`false` (+ `LicenseType` PAYG/Paid) |
+| Apply without activating? | **Yes** (create `Inactive`, activate later) | **No** — subscribing activates immediately |
+| Script modes | `-ProvisionLicenses` / `-ActivateLicenses` / `-DeactivateLicenses` | `-EnableEsuPerMachine` / `-DisableEsuPerMachine` |
+| Best for | Many SQL VMs on a few physical hosts | Few machines, or physical servers without heavy virtualization |
+
+The per-machine mode reads the current SQL extension settings, **preserves them**, and only changes the
+ESU keys (`LicenseType`, `enableExtendedSecurityUpdates`, `esuLastUpdatedTimestamp`).
+
 ### Activation state lifecycle
 
 The license `activationState` property (enum `State`) drives the lifecycle:
@@ -54,15 +70,18 @@ physical core count (`detectedProperties.coreCount`), and proposes **one ESU lic
 | Mode | Switch | Description |
 | ---- | ------ | ----------- |
 | Detect | `-ReadOnly` (default) | Detects the instances and generates the CSV files. **No change is made.** |
-| Provision | `-ProvisionLicenses` | Creates the ESU licenses. `Inactive` by default (apply without activating); add `-Activate` to create them already activated. |
-| Activate | `-ActivateLicenses` | Sets `activationState = Active` on existing licenses. |
-| Deactivate | `-DeactivateLicenses` | Sets `activationState = Terminated` (stops the ESU subscription). |
+| Provision | `-ProvisionLicenses` | Creates the ESU p-core licenses. `Inactive` by default (apply without activating); add `-Activate` to create them already activated. |
+| Activate | `-ActivateLicenses` | Sets `activationState = Active` on existing p-core licenses. |
+| Deactivate | `-DeactivateLicenses` | Sets `activationState = Terminated` (stops the p-core ESU subscription). |
+| Enable per machine | `-EnableEsuPerMachine` | v-core model: subscribes each Arc machine hosting the version to ESUs (sets `LicenseType` + `enableExtendedSecurityUpdates=true`). Activates immediately. |
+| Disable per machine | `-DisableEsuPerMachine` | v-core model: unsubscribes the machines (`enableExtendedSecurityUpdates=false`). |
 
 Common parameters:
 
 - `-SqlVersion` – `SQL Server 2012` / `SQL Server 2014` / `SQL Server 2016` (default `SQL Server 2016`).
-- `-ScopeType` – `ResourceGroup` (default) / `Subscription` / `Tenant`. One license is proposed per scope unit.
-- `-BillingPlan` – `PAYG` (default) / `Paid`.
+- `-ScopeType` – `ResourceGroup` (default) / `Subscription` / `Tenant`. One p-core license is proposed per scope unit.
+- `-BillingPlan` – `PAYG` (default) / `Paid` (p-core license billing plan).
+- `-LicenseType` – `PAYG` (default) / `Paid`. Used by `-EnableEsuPerMachine`. If omitted, an existing PAYG/Paid license type on the machine is preserved.
 
 ## Generated files
 
@@ -116,6 +135,21 @@ One license per subscription instead of per resource group:
 
 ```powershell
 .\SQLServerESUsSetLicenses.ps1 -ReadOnly -ScopeType Subscription
+```
+
+### v-core model (per machine)
+
+Subscribe every Arc machine that hosts a SQL Server 2016 instance to ESUs (activates immediately):
+
+```powershell
+.\SQLServerESUsSetLicenses.ps1 -EnableEsuPerMachine
+.\SQLServerESUsSetLicenses.ps1 -EnableEsuPerMachine -LicenseType Paid
+```
+
+Unsubscribe the machines from ESUs (stops the per-machine charges):
+
+```powershell
+.\SQLServerESUsSetLicenses.ps1 -DisableEsuPerMachine
 ```
 
 ## References

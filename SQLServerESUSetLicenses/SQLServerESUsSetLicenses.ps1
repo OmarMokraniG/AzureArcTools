@@ -19,6 +19,13 @@
   that date. You can create the licenses now in the Inactive state and activate them on/after that
   date to avoid early charges.
 
+  This script also supports the alternative PER-MACHINE ESU subscription (v-core model): it enables or
+  disables ESUs directly in the SQL Server configuration of each Azure Arc machine by setting the
+  'enableExtendedSecurityUpdates' property on the Azure Extension for SQL Server (and 'LicenseType' =
+  PAYG/Paid). That model is billed by v-cores (or physical cores on bare metal), the extension
+  auto-detects host size/type/edition, and subscribing activates it immediately (there is no
+  "create inactive, activate later"). Existing extension settings are preserved.
+
   Docs:
     https://learn.microsoft.com/sql/sql-server/azure-arc/extended-security-updates
     https://learn.microsoft.com/sql/sql-server/azure-arc/manage-configuration#manage-pcore-esu-license
@@ -59,6 +66,18 @@
 
    .\SQLServerESUsSetLicenses.ps1 -DeactivateLicenses -SourceLicenseInfoFileDeactivate MyAssignmentInfo.csv
 
+.EXAMPLE
+  Per-machine (v-core) model: subscribe every Arc machine that hosts a SQL Server 2016 instance to
+  Extended Security Updates, setting the license type to pay-as-you-go. This activates ESUs immediately.
+
+   .\SQLServerESUsSetLicenses.ps1 -EnableEsuPerMachine
+   .\SQLServerESUsSetLicenses.ps1 -EnableEsuPerMachine -LicenseType Paid
+
+.EXAMPLE
+  Per-machine (v-core) model: unsubscribe the machines from Extended Security Updates (stops charges).
+
+   .\SQLServerESUsSetLicenses.ps1 -DisableEsuPerMachine
+
 .NOTES
   The ESU p-core license covers the physical cores of the hosts in the selected scope with unlimited
   virtualization. This script sizes each license as the sum of the physical cores of the DISTINCT
@@ -95,6 +114,23 @@ Param (
   [Parameter(Mandatory = $false, ParameterSetName = 'DeactivateLicenses')]
   [string]$SourceLicenseInfoFileDeactivate,
 
+  # Per-machine (v-core) model: subscribe each Arc machine to ESUs in the SQL Server configuration.
+  [Parameter(Mandatory = $false, ParameterSetName = 'EnableEsuPerMachine')]
+  [switch]$EnableEsuPerMachine,
+  [Parameter(Mandatory = $false, ParameterSetName = 'EnableEsuPerMachine')]
+  [string]$SourceInstancesFile,
+  # License type set on the SQL extension when subscribing. Must be PAYG or Paid for ESUs.
+  # If not specified, an existing PAYG/Paid license type on the machine is preserved.
+  [Parameter(Mandatory = $false, ParameterSetName = 'EnableEsuPerMachine')]
+  [ValidateSet('PAYG', 'Paid')]
+  [string]$LicenseType = 'PAYG',
+
+  # Per-machine (v-core) model: unsubscribe each Arc machine from ESUs.
+  [Parameter(Mandatory = $false, ParameterSetName = 'DisableEsuPerMachine')]
+  [switch]$DisableEsuPerMachine,
+  [Parameter(Mandatory = $false, ParameterSetName = 'DisableEsuPerMachine')]
+  [string]$SourceInstancesFileDisable,
+
   # SQL Server version eligible for ESU. Valid values: 'SQL Server 2012', 'SQL Server 2014', 'SQL Server 2016'.
   [Parameter(Mandatory = $false)]
   [ValidateSet('SQL Server 2012', 'SQL Server 2014', 'SQL Server 2016')]
@@ -116,6 +152,10 @@ $apiversion = '2026-03-01-preview'
 
 # Minimum number of physical cores per ESU license.
 $MinimumPhysicalCores = 16
+
+# API version for the Azure Extension for SQL Server (Microsoft.HybridCompute machine extension),
+# used by the per-machine (v-core) ESU subscription modes.
+$machineExtensionApiVersion = '2024-07-10'
 
 #region Helper functions
 
@@ -147,22 +187,15 @@ function Set-SqlEsuActivationState {
   return $result
 }
 
-#endregion
-
-#region Detect (ReadOnly) and build the source CSV files
-if ($ReadOnly -or ($ProvisionLicenses -and (-not $SourceLicensesFile))) {
-
-  if ($ReadOnly) {
-    Write-Host "Running in read-only mode. No licenses will be created, activated or terminated." -ForegroundColor Yellow
-  }
-  Write-Host "Querying Azure Arc-enabled SQL Server instances of version '$SqlVersion'..." -ForegroundColor Green
-
+function Get-SqlEsuArcInstances {
   # Detect the out-of-support SQL Server instances enabled by Azure Arc and join them to their
   # hosting Arc machine to obtain the physical core count (detectedProperties.coreCount).
+  param([Parameter(Mandatory)] [string]$Version)
+  Write-Host "Querying Azure Arc-enabled SQL Server instances of version '$Version'..." -ForegroundColor Green
   $sqlQuery = @"
 resources
 | where type =~ 'microsoft.azurearcdata/sqlserverinstances'
-| where tostring(properties.version) == '$SqlVersion'
+| where tostring(properties.version) == '$Version'
 | extend machineId = tolower(tostring(properties.containerResourceId))
 | extend sqlEdition = tostring(properties.edition), vCores = toint(properties.vCore), licenseType = tostring(properties.licenseType)
 | join kind=leftouter (
@@ -182,8 +215,71 @@ resources
           Type, osName, machineStatus
 | order by subscriptionId asc, resourceGroup asc, machineName asc
 "@
+  return Search-AzGraph -Query $sqlQuery -First 1000
+}
 
-  $sqlInstances = Search-AzGraph -Query $sqlQuery -First 1000
+function Set-SqlEsuPerMachine {
+  # Enable or disable the per-machine (v-core) ESU subscription on the Azure Extension for SQL Server.
+  param(
+    [Parameter(Mandatory)] [string]$MachineId,
+    [Parameter(Mandatory)] [bool]$Enable,
+    [string]$LicenseType = 'PAYG',
+    [switch]$ForceLicenseType
+  )
+  # Locate the SQL extension on the machine (Windows or Linux) and read its current settings.
+  $extName = $null; $extObj = $null
+  foreach ($n in @('WindowsAgent.SqlServer', 'LinuxAgent.SqlServer')) {
+    $get = Invoke-AzRestMethod -Path "$MachineId/extensions/$($n)?api-version=$machineExtensionApiVersion" -Method GET
+    if ($get.StatusCode -eq 200) { $extName = $n; $extObj = $get.Content | ConvertFrom-Json; break }
+  }
+  if (-not $extName) { throw "Azure Extension for SQL Server not found on $MachineId." }
+  if ($extObj.properties.provisioningState -ne 'Succeeded') {
+    throw "Extension is in '$($extObj.properties.provisioningState)' state; skipping."
+  }
+
+  # Preserve ALL existing settings (an update replaces the settings object) and change only ESU keys.
+  $settings = @{}
+  if ($extObj.properties.settings) {
+    foreach ($p in $extObj.properties.settings.PSObject.Properties) { $settings[$p.Name] = $p.Value }
+  }
+
+  if ($Enable) {
+    $currentLicense = [string]$settings['LicenseType']
+    if ($ForceLicenseType -or ($currentLicense -notin @('PAYG', 'Paid'))) {
+      $settings['LicenseType'] = $LicenseType
+    }
+    if (@('PAYG', 'Paid') -notcontains [string]$settings['LicenseType']) {
+      throw "LicenseType must be 'PAYG' or 'Paid' to subscribe to ESUs (current: '$($settings['LicenseType'])')."
+    }
+    $settings['enableExtendedSecurityUpdates'] = $true
+  }
+  else {
+    $settings['enableExtendedSecurityUpdates'] = $false
+  }
+  $settings['esuLastUpdatedTimestamp'] = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+
+  $body = @{ properties = @{ settings = $settings } } | ConvertTo-Json -Depth 30
+  $result = Invoke-AzRestMethod -Path "$MachineId/extensions/$($extName)?api-version=$machineExtensionApiVersion" -Method PATCH -Payload $body -ErrorAction Stop
+  if ($result.StatusCode -ge 400) {
+    throw "PATCH failed for $MachineId (HTTP $($result.StatusCode)): $($result.Content)"
+  }
+  return [PSCustomObject]@{
+    extension   = $extName
+    licenseType = $settings['LicenseType']
+    esu         = $settings['enableExtendedSecurityUpdates']
+    statusCode  = $result.StatusCode
+  }
+}
+
+#endregion
+
+#region Detect (ReadOnly) and build the source CSV files
+if ($ReadOnly -or ($ProvisionLicenses -and (-not $SourceLicensesFile))) {
+
+  if ($ReadOnly) {
+    Write-Host "Running in read-only mode. No licenses will be created, activated or terminated." -ForegroundColor Yellow
+  }
+  $sqlInstances = Get-SqlEsuArcInstances -Version $SqlVersion
 
   if (-not $sqlInstances -or $sqlInstances.Count -eq 0) {
     Write-Host "No Azure Arc-enabled SQL Server instances of version '$SqlVersion' were found in the accessible subscriptions." -ForegroundColor Yellow
@@ -366,6 +462,66 @@ if ($DeactivateLicenses) {
     }
     catch {
       Write-Host "  Could not terminate '$($license.LicenseName)':" -ForegroundColor Red
+      $_.Exception.Message
+    }
+  }
+}
+#endregion
+
+#region Enable ESUs per machine (v-core subscription in the SQL Server configuration)
+if ($EnableEsuPerMachine) {
+  Write-Host "Subscribing Azure Arc machines that host '$SqlVersion' to Extended Security Updates (v-core model, LicenseType = $LicenseType) ..." -ForegroundColor Green
+  Write-Host "This enables ESUs in the SQL Server configuration of each machine and activates the subscription immediately." -ForegroundColor Yellow
+
+  if ($SourceInstancesFile) {
+    $instances = Import-Csv -Path .\$SourceInstancesFile -ErrorAction Stop
+  }
+  else {
+    $instances = Get-SqlEsuArcInstances -Version $SqlVersion
+  }
+
+  $machines = $instances | Where-Object { $_.machineId } | Sort-Object machineId -Unique
+  if (-not $machines) {
+    Write-Host "No Azure Arc machines hosting '$SqlVersion' instances were found." -ForegroundColor Yellow
+  }
+  # Only override LicenseType when the caller passed it explicitly; otherwise keep an existing PAYG/Paid value.
+  $forceLicense = $PSBoundParameters.ContainsKey('LicenseType')
+  foreach ($m in $machines) {
+    try {
+      $r = Set-SqlEsuPerMachine -MachineId $m.machineId -Enable $true -LicenseType $LicenseType -ForceLicenseType:$forceLicense
+      Write-Host "  Subscribed '$($m.machineName)' (extension $($r.extension), LicenseType = $($r.licenseType), ESU = $($r.esu))." -ForegroundColor Green
+    }
+    catch {
+      Write-Host "  Could not subscribe '$($m.machineName)':" -ForegroundColor Red
+      $_.Exception.Message
+    }
+  }
+}
+#endregion
+
+#region Disable ESUs per machine (unsubscribe in the SQL Server configuration)
+if ($DisableEsuPerMachine) {
+  Write-Host "Unsubscribing Azure Arc machines that host '$SqlVersion' from Extended Security Updates (v-core model) ..." -ForegroundColor Green
+  Write-Host "This stops the per-machine ESU charges." -ForegroundColor Yellow
+
+  if ($SourceInstancesFileDisable) {
+    $instances = Import-Csv -Path .\$SourceInstancesFileDisable -ErrorAction Stop
+  }
+  else {
+    $instances = Get-SqlEsuArcInstances -Version $SqlVersion
+  }
+
+  $machines = $instances | Where-Object { $_.machineId } | Sort-Object machineId -Unique
+  if (-not $machines) {
+    Write-Host "No Azure Arc machines hosting '$SqlVersion' instances were found." -ForegroundColor Yellow
+  }
+  foreach ($m in $machines) {
+    try {
+      $r = Set-SqlEsuPerMachine -MachineId $m.machineId -Enable $false
+      Write-Host "  Unsubscribed '$($m.machineName)' (extension $($r.extension), ESU = $($r.esu))." -ForegroundColor Green
+    }
+    catch {
+      Write-Host "  Could not unsubscribe '$($m.machineName)':" -ForegroundColor Red
       $_.Exception.Message
     }
   }

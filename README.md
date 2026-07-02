@@ -78,9 +78,9 @@ This repository gathers a set of tools to work with your Azure Arc Environment
 
 - **[SQLServerESUSetLicenses](/SQLServerESUSetLicenses/)**
 
-  Toolset for managing SQL Server Extended Security Update (ESU) p-core licenses for out-of-support SQL Server instances enabled by Azure Arc (SQL Server 2016 by default). It is the SQL Server counterpart of ESUSetLicenses: it can apply the ESU licenses without activating them and activate them later.
+  Toolset for managing SQL Server Extended Security Update (ESU) subscriptions for out-of-support SQL Server instances enabled by Azure Arc (SQL Server 2016 by default). It is the SQL Server counterpart of ESUSetLicenses and supports both ESU models: p-core licenses that can be applied without activating and activated later, and the per-machine v-core subscription (enable/disable ESUs in the SQL Server configuration of each Arc machine).
 
-  `SQLServerESUsSetLicenses.ps1` - PowerShell script to detect Arc-enabled SQL Server 2016 instances and create, activate, or terminate their SQL Server ESU p-core licenses (Microsoft.AzureArcData/sqlServerEsuLicenses)
+  `SQLServerESUsSetLicenses.ps1` - PowerShell script to detect Arc-enabled SQL Server 2016 instances and either manage their SQL Server ESU p-core licenses (Microsoft.AzureArcData/sqlServerEsuLicenses) or enable/disable the per-machine v-core ESU subscription
 
   `SQLServerESULicensesSourcefilesample.csv` - Sample CSV template file for bulk SQL Server ESU license operations
 
