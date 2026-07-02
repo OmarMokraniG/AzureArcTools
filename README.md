@@ -76,6 +76,16 @@ This repository gathers a set of tools to work with your Azure Arc Environment
 
   `README.md` - Documentation for ESU license management tools and processes
 
+- **[SQLServerESUSetLicenses](/SQLServerESUSetLicenses/)**
+
+  Toolset for managing SQL Server Extended Security Update (ESU) p-core licenses for out-of-support SQL Server instances enabled by Azure Arc (SQL Server 2016 by default). It is the SQL Server counterpart of ESUSetLicenses: it can apply the ESU licenses without activating them and activate them later.
+
+  `SQLServerESUsSetLicenses.ps1` - PowerShell script to detect Arc-enabled SQL Server 2016 instances and create, activate, or terminate their SQL Server ESU p-core licenses (Microsoft.AzureArcData/sqlServerEsuLicenses)
+
+  `SQLServerESULicensesSourcefilesample.csv` - Sample CSV template file for bulk SQL Server ESU license operations
+
+  `README.md` - Documentation for the SQL Server ESU license management script
+
 - **[Extensions](/Extensions/)**
   
   Comprehensive suite of scripts for managing Azure Arc extensions, including installation, updates, removal of failed extensions, inventory reporting, and configuration management.
